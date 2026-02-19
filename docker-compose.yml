@@ -1,0 +1,37 @@
+version: "3.9"
+
+services:
+  # ── Python FastAPI + yfinance ────────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: n50_backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"       # expose for direct API access / debugging
+    environment:
+      - PYTHONUNBUFFERED=1
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # ── React + Nginx ────────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: n50_frontend
+    restart: unless-stopped
+    ports:
+      - "80:80"           # main app served here
+    depends_on:
+      backend:
+        condition: service_healthy
+
+networks:
+  default:
+    name: n50_network
