@@ -1,6 +1,7 @@
 """
 N50 Swing Algo — Backend API
-Data: Twelve Data (free tier, 800 req/day, real NSE prices)
+Data: Stooq.com (free, no API key, no account, NSE daily data)
+URL format: https://stooq.com/q/d/l/?s=reliance.ns&i=d
 """
 
 from contextlib import asynccontextmanager
@@ -12,15 +13,11 @@ import pandas as pd
 import threading
 import logging
 import time
-import os
+import io
 from datetime import datetime, timedelta
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-# ─── CONFIG ───────────────────────────────────────────────────────────────────
-TWELVE_API_KEY = os.environ.get("TWELVE_API_KEY", "")
-TWELVE_BASE    = "https://api.twelvedata.com"
 
 # ─── NIFTY 50 ─────────────────────────────────────────────────────────────────
 NIFTY50_SYMBOLS = [
@@ -60,58 +57,53 @@ SECTOR_MAP = {
 _cache: dict = {}
 _cache_ts: float = 0
 _fetching: bool = False
-CACHE_TTL = 3600  # 1 hour — conserve API calls (800/day free tier)
+CACHE_TTL = 3600  # 1 hour
 
-# ─── TWELVE DATA FETCHER ──────────────────────────────────────────────────────
-def fetch_time_series(symbol: str, outputsize: int = 30) -> pd.DataFrame:
-    """Fetch daily OHLCV from Twelve Data for an NSE symbol."""
-    url = f"{TWELVE_BASE}/time_series"
-    params = {
-        "symbol": f"{symbol}:NSE",
-        "interval": "1day",
-        "outputsize": outputsize,
-        "apikey": TWELVE_API_KEY,
-    }
-    with httpx.Client(timeout=15) as client:
-        r = client.get(url, params=params)
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+}
+
+# ─── STOOQ FETCHER ────────────────────────────────────────────────────────────
+def fetch_stooq(symbol: str) -> pd.DataFrame:
+    """
+    Fetch daily OHLCV from Stooq for NSE symbol.
+    Stooq uses lowercase .ns suffix: reliance.ns
+    Returns CSV with columns: Date, Open, High, Low, Close, Volume
+    """
+    ticker = symbol.lower().replace("&", "") + ".ns"
+    url = f"https://stooq.com/q/d/l/?s={ticker}&i=d"
+
+    with httpx.Client(timeout=20, headers=HEADERS, follow_redirects=True) as client:
+        r = client.get(url)
         r.raise_for_status()
-        data = r.json()
 
-    if data.get("status") == "error":
-        raise ValueError(data.get("message", "Twelve Data error"))
+    # Stooq returns "No data" for invalid symbols
+    if "No data" in r.text or len(r.text.strip()) < 50:
+        raise ValueError(f"No data returned for {symbol}")
 
-    values = data.get("values", [])
-    if not values:
-        raise ValueError("No values returned")
+    df = pd.read_csv(io.StringIO(r.text))
+    df.columns = [c.strip().lower() for c in df.columns]
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values("date").tail(60).reset_index(drop=True)
 
-    df = pd.DataFrame(values)
-    df["datetime"] = pd.to_datetime(df["datetime"])
-    df = df.sort_values("datetime").reset_index(drop=True)
     for col in ["open", "high", "low", "close"]:
-        df[col] = df[col].astype(float)
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df = df.dropna(subset=["close"])
     return df
 
 
-def fetch_nifty_index() -> dict:
-    """Fetch Nifty 50 index from Twelve Data."""
+def fetch_nifty() -> dict:
     try:
-        url = f"{TWELVE_BASE}/time_series"
-        params = {
-            "symbol": "NIFTY:NSE",
-            "interval": "1day",
-            "outputsize": 2,
-            "apikey": TWELVE_API_KEY,
-        }
-        with httpx.Client(timeout=15) as client:
-            r = client.get(url, params=params)
-            data = r.json()
-
-        values = data.get("values", [])
-        if len(values) < 1:
-            return {"price": 22450.0, "change": 0.0, "changePct": 0.0}
-
-        price = round(float(values[0]["close"]), 2)
-        prev  = round(float(values[1]["close"]), 2) if len(values) > 1 else price
+        # Nifty 50 index on Stooq
+        url = "https://stooq.com/q/d/l/?s=^nsei&i=d"
+        with httpx.Client(timeout=20, headers=HEADERS, follow_redirects=True) as client:
+            r = client.get(url)
+        df = pd.read_csv(io.StringIO(r.text))
+        df.columns = [c.strip().lower() for c in df.columns]
+        df = df.sort_values("date").tail(2)
+        price = round(float(df["close"].iloc[-1]), 2)
+        prev  = round(float(df["close"].iloc[-2]), 2) if len(df) > 1 else price
         chg   = round(price - prev, 2)
         return {"price": price, "change": chg, "changePct": round(chg / prev * 100, 2)}
     except Exception as e:
@@ -212,7 +204,7 @@ def generate_signal(sym: str, df: pd.DataFrame) -> dict:
     if bbpos < 0.2:   sc += 1.5; rs.append("Price near BB lower band")
     elif bbpos > 0.8: sc -= 1.5; rs.append("Price near BB upper band")
 
-    if price > sma20 * 1.02:  sc += 0.5
+    if price > sma20 * 1.02:   sc += 0.5
     elif price < sma20 * 0.98: sc -= 0.5
 
     direction  = "LONG" if sc >= 1 else "SHORT" if sc <= -1 else "NEUTRAL"
@@ -261,17 +253,17 @@ def do_fetch():
     if _fetching:
         return
     _fetching = True
-    logger.info("Fetching Nifty 50 from Twelve Data...")
+    logger.info("Fetching Nifty 50 from Stooq...")
     results = []
 
     for sym in NIFTY50_SYMBOLS:
         try:
-            df  = fetch_time_series(sym, outputsize=30)
+            df  = fetch_stooq(sym)
             sig = generate_signal(sym, df)
             if sig:
                 results.append(sig)
                 logger.info(f"✓ {sym}: ₹{sig['price']} [{sig['direction']}]")
-            time.sleep(0.25)  # 4 req/sec max on free tier
+            time.sleep(0.3)  # be polite to Stooq
         except Exception as e:
             logger.error(f"✗ {sym}: {e}")
             continue
@@ -284,30 +276,27 @@ def do_fetch():
         neutrals = sum(1 for s in results if s["direction"] == "NEUTRAL")
         _cache = {
             "stocks": results,
-            "nifty": fetch_nifty_index(),
+            "nifty": fetch_nifty(),
             "summary": {"longs": longs, "shorts": shorts, "neutrals": neutrals, "total": len(results)},
             "fetchedAt": datetime.now().isoformat(),
             "nextRefresh": CACHE_TTL,
-            "dataSource": "Twelve Data (NSE real-time)",
+            "dataSource": "Stooq (NSE daily data, free)",
         }
         _cache_ts = time.time()
         logger.info("Cache updated ✓")
     else:
-        logger.error("No results — check TWELVE_API_KEY env var")
+        logger.error("No results fetched!")
 
     _fetching = False
 
 # ─── LIFESPAN ─────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    if not TWELVE_API_KEY:
-        logger.error("TWELVE_API_KEY env var not set!")
-    else:
-        threading.Thread(target=do_fetch, daemon=True).start()
-        logger.info("Startup: background fetch triggered")
+    threading.Thread(target=do_fetch, daemon=True).start()
+    logger.info("Startup: background fetch triggered")
     yield
 
-app = FastAPI(title="N50 Swing Algo API", version="3.0.0", lifespan=lifespan)
+app = FastAPI(title="N50 Swing Algo API", version="4.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -319,13 +308,12 @@ app.add_middleware(
 # ─── ROUTES ───────────────────────────────────────────────────────────────────
 @app.get("/")
 def root():
-    return {"status": "ok", "message": "N50 Swing Algo API v3 — Twelve Data"}
+    return {"status": "ok", "message": "N50 Swing Algo API v4 — Stooq"}
 
 @app.get("/api/health")
 def health():
     return {
         "status": "healthy",
-        "apiKeySet": bool(TWELVE_API_KEY),
         "cacheAge": round(time.time() - _cache_ts) if _cache_ts else None,
         "stocksCached": len(_cache.get("stocks", [])) if _cache else 0,
         "fetching": _fetching,
@@ -333,17 +321,15 @@ def health():
 
 @app.get("/api/test")
 def test():
-    """Test Twelve Data API connectivity."""
-    if not TWELVE_API_KEY:
-        return {"status": "error", "message": "TWELVE_API_KEY env var not set"}
+    """Test Stooq connectivity with RELIANCE."""
     try:
-        df = fetch_time_series("RELIANCE", outputsize=5)
+        df = fetch_stooq("RELIANCE")
         return {
             "status": "ok",
-            "symbol": "RELIANCE:NSE",
+            "symbol": "RELIANCE.ns (Stooq)",
             "rows": len(df),
             "lastClose": round(float(df["close"].iloc[-1]), 2),
-            "lastDate": str(df["datetime"].iloc[-1].date()),
+            "lastDate": str(df["date"].iloc[-1].date()),
         }
     except Exception as e:
         return {"status": "error", "message": str(e)}
@@ -352,8 +338,6 @@ def test():
 def refresh():
     """Manually trigger a re-fetch."""
     global _fetching
-    if not TWELVE_API_KEY:
-        return {"status": "error", "message": "TWELVE_API_KEY not set"}
     if _fetching:
         return {"status": "already fetching"}
     threading.Thread(target=do_fetch, daemon=True).start()
@@ -365,24 +349,20 @@ def get_stocks():
     if _cache and (time.time() - _cache_ts) < CACHE_TTL:
         return JSONResponse(content=_cache)
 
-    # Stale cache — return it and refresh in background
+    # Stale — return and refresh in background
     if _cache:
         if not _fetching:
             threading.Thread(target=do_fetch, daemon=True).start()
         return JSONResponse(content=_cache)
 
-    # No cache yet
-    if not TWELVE_API_KEY:
-        return JSONResponse(status_code=503, content={
-            "error": "TWELVE_API_KEY environment variable not set on server"
-        })
-
+    # Still loading
     if _fetching:
         return JSONResponse(status_code=503, content={
             "error": "Data is loading for the first time, please retry in 60 seconds",
             "fetching": True,
         })
 
+    # Trigger and return
     threading.Thread(target=do_fetch, daemon=True).start()
     return JSONResponse(status_code=503, content={
         "error": "Fetching data now, please retry in 60 seconds",
