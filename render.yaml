@@ -14,7 +14,8 @@ services:
     healthCheckPath: /api/health
 
   # ── Frontend: React Static Site ───────────────────────────────────────────
-  - type: static
+  - type: web
+    env: static
     name: n50-frontend
     rootDir: frontend
     buildCommand: npm install && npm run build
