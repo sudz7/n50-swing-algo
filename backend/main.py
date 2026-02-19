@@ -1,21 +1,26 @@
 """
 N50 Swing Algo — Backend API
-Yahoo Finance (free, NSE ~15min delayed)
+Data: Twelve Data (free tier, 800 req/day, real NSE prices)
 """
 
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-import yfinance as yf
+import httpx
 import pandas as pd
 import threading
 import logging
 import time
+import os
 from datetime import datetime, timedelta
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# ─── CONFIG ───────────────────────────────────────────────────────────────────
+TWELVE_API_KEY = os.environ.get("TWELVE_API_KEY", "")
+TWELVE_BASE    = "https://api.twelvedata.com"
 
 # ─── NIFTY 50 ─────────────────────────────────────────────────────────────────
 NIFTY50_SYMBOLS = [
@@ -32,22 +37,22 @@ NIFTY50_SYMBOLS = [
 ]
 
 SECTOR_MAP = {
-    "RELIANCE": "Energy",    "TCS": "IT",           "HDFCBANK": "Banking",
-    "INFY": "IT",            "ICICIBANK": "Banking", "HINDUNILVR": "FMCG",
-    "SBIN": "Banking",       "BHARTIARTL": "Telecom","ITC": "FMCG",
-    "KOTAKBANK": "Banking",  "LT": "Infra",         "AXISBANK": "Banking",
-    "ASIANPAINT": "Paints",  "MARUTI": "Auto",      "WIPRO": "IT",
-    "SUNPHARMA": "Pharma",   "TITAN": "Consumer",   "BAJFINANCE": "NBFC",
-    "POWERGRID": "Power",    "NTPC": "Power",        "TATASTEEL": "Metal",
-    "JSWSTEEL": "Metal",     "ADANIPORTS": "Port",  "HCLTECH": "IT",
-    "ULTRACEMCO": "Cement",  "NESTLEIND": "FMCG",   "TATAMOTORS": "Auto",
-    "M&M": "Auto",           "ONGC": "Energy",       "COALINDIA": "Mining",
-    "BPCL": "Energy",        "GRASIM": "Conglomerate","TECHM": "IT",
-    "INDUSINDBK": "Banking", "EICHERMOT": "Auto",   "DRREDDY": "Pharma",
-    "CIPLA": "Pharma",       "DIVISLAB": "Pharma",  "BAJAJFINSV": "NBFC",
+    "RELIANCE": "Energy",    "TCS": "IT",             "HDFCBANK": "Banking",
+    "INFY": "IT",            "ICICIBANK": "Banking",  "HINDUNILVR": "FMCG",
+    "SBIN": "Banking",       "BHARTIARTL": "Telecom", "ITC": "FMCG",
+    "KOTAKBANK": "Banking",  "LT": "Infra",           "AXISBANK": "Banking",
+    "ASIANPAINT": "Paints",  "MARUTI": "Auto",        "WIPRO": "IT",
+    "SUNPHARMA": "Pharma",   "TITAN": "Consumer",     "BAJFINANCE": "NBFC",
+    "POWERGRID": "Power",    "NTPC": "Power",          "TATASTEEL": "Metal",
+    "JSWSTEEL": "Metal",     "ADANIPORTS": "Port",    "HCLTECH": "IT",
+    "ULTRACEMCO": "Cement",  "NESTLEIND": "FMCG",     "TATAMOTORS": "Auto",
+    "M&M": "Auto",           "ONGC": "Energy",         "COALINDIA": "Mining",
+    "BPCL": "Energy",        "GRASIM": "Conglomerate", "TECHM": "IT",
+    "INDUSINDBK": "Banking", "EICHERMOT": "Auto",     "DRREDDY": "Pharma",
+    "CIPLA": "Pharma",       "DIVISLAB": "Pharma",    "BAJAJFINSV": "NBFC",
     "TATACONSUM": "FMCG",    "APOLLOHOSP": "Healthcare","BRITANNIA": "FMCG",
-    "HEROMOTOCO": "Auto",    "HINDALCO": "Metal",   "SBILIFE": "Insurance",
-    "HDFCLIFE": "Insurance", "UPL": "Agro",         "SHRIRAMFIN": "NBFC",
+    "HEROMOTOCO": "Auto",    "HINDALCO": "Metal",     "SBILIFE": "Insurance",
+    "HDFCLIFE": "Insurance", "UPL": "Agro",           "SHRIRAMFIN": "NBFC",
     "BEL": "Defence",        "TRENT": "Retail",
 }
 
@@ -55,7 +60,63 @@ SECTOR_MAP = {
 _cache: dict = {}
 _cache_ts: float = 0
 _fetching: bool = False
-CACHE_TTL = 120
+CACHE_TTL = 3600  # 1 hour — conserve API calls (800/day free tier)
+
+# ─── TWELVE DATA FETCHER ──────────────────────────────────────────────────────
+def fetch_time_series(symbol: str, outputsize: int = 30) -> pd.DataFrame:
+    """Fetch daily OHLCV from Twelve Data for an NSE symbol."""
+    url = f"{TWELVE_BASE}/time_series"
+    params = {
+        "symbol": f"{symbol}:NSE",
+        "interval": "1day",
+        "outputsize": outputsize,
+        "apikey": TWELVE_API_KEY,
+    }
+    with httpx.Client(timeout=15) as client:
+        r = client.get(url, params=params)
+        r.raise_for_status()
+        data = r.json()
+
+    if data.get("status") == "error":
+        raise ValueError(data.get("message", "Twelve Data error"))
+
+    values = data.get("values", [])
+    if not values:
+        raise ValueError("No values returned")
+
+    df = pd.DataFrame(values)
+    df["datetime"] = pd.to_datetime(df["datetime"])
+    df = df.sort_values("datetime").reset_index(drop=True)
+    for col in ["open", "high", "low", "close"]:
+        df[col] = df[col].astype(float)
+    return df
+
+
+def fetch_nifty_index() -> dict:
+    """Fetch Nifty 50 index from Twelve Data."""
+    try:
+        url = f"{TWELVE_BASE}/time_series"
+        params = {
+            "symbol": "NIFTY:NSE",
+            "interval": "1day",
+            "outputsize": 2,
+            "apikey": TWELVE_API_KEY,
+        }
+        with httpx.Client(timeout=15) as client:
+            r = client.get(url, params=params)
+            data = r.json()
+
+        values = data.get("values", [])
+        if len(values) < 1:
+            return {"price": 22450.0, "change": 0.0, "changePct": 0.0}
+
+        price = round(float(values[0]["close"]), 2)
+        prev  = round(float(values[1]["close"]), 2) if len(values) > 1 else price
+        chg   = round(price - prev, 2)
+        return {"price": price, "change": chg, "changePct": round(chg / prev * 100, 2)}
+    except Exception as e:
+        logger.error(f"Nifty index error: {e}")
+        return {"price": 22450.0, "change": 0.0, "changePct": 0.0}
 
 # ─── INDICATORS ───────────────────────────────────────────────────────────────
 def calc_rsi(s: pd.Series, p: int = 14) -> float:
@@ -71,9 +132,13 @@ def calc_rsi(s: pd.Series, p: int = 14) -> float:
 def calc_macd(s: pd.Series) -> dict:
     if len(s) < 26:
         return {"macd": 0, "signal": 0, "hist": 0}
-    m = s.ewm(span=12, adjust=False).mean() - s.ewm(span=26, adjust=False).mean()
+    m   = s.ewm(span=12, adjust=False).mean() - s.ewm(span=26, adjust=False).mean()
     sig = m.ewm(span=9, adjust=False).mean()
-    return {"macd": round(float(m.iloc[-1]), 2), "signal": round(float(sig.iloc[-1]), 2), "hist": round(float((m - sig).iloc[-1]), 2)}
+    return {
+        "macd":   round(float(m.iloc[-1]), 2),
+        "signal": round(float(sig.iloc[-1]), 2),
+        "hist":   round(float((m - sig).iloc[-1]), 2),
+    }
 
 def calc_bb(s: pd.Series, p: int = 20) -> dict:
     if len(s) < p:
@@ -81,29 +146,43 @@ def calc_bb(s: pd.Series, p: int = 20) -> dict:
         return {"upper": v, "lower": v, "mid": v, "width": 0}
     sma = s.rolling(p).mean().iloc[-1]
     std = s.rolling(p).std().iloc[-1]
-    return {"upper": round(float(sma + 2*std), 2), "lower": round(float(sma - 2*std), 2),
-            "mid": round(float(sma), 2), "width": round(float(std*4/sma*100), 2) if sma else 0}
+    return {
+        "upper": round(float(sma + 2 * std), 2),
+        "lower": round(float(sma - 2 * std), 2),
+        "mid":   round(float(sma), 2),
+        "width": round(float(std * 4 / sma * 100), 2) if sma else 0,
+    }
 
 def calc_atr(hi: pd.Series, lo: pd.Series, cl: pd.Series, p: int = 14) -> float:
     if len(cl) < p + 1:
         return 0
-    tr = pd.concat([hi-lo, (hi-cl.shift()).abs(), (lo-cl.shift()).abs()], axis=1).max(axis=1)
+    tr = pd.concat([
+        hi - lo,
+        (hi - cl.shift()).abs(),
+        (lo - cl.shift()).abs(),
+    ], axis=1).max(axis=1)
     return round(float(tr.rolling(p).mean().iloc[-1]), 2)
 
-def strike(price: float) -> int:
-    if price > 5000: return round(price/100)*100
-    if price > 1000: return round(price/50)*50
-    if price > 500:  return round(price/20)*20
-    return round(price/10)*10
+def to_strike(price: float) -> int:
+    if price > 5000: return round(price / 100) * 100
+    if price > 1000: return round(price / 50)  * 50
+    if price > 500:  return round(price / 20)  * 20
+    return round(price / 10) * 10
 
 def next_expiry() -> str:
     t = datetime.now()
     d = (3 - t.weekday() + 7) % 7 or 7
     return (t + timedelta(days=d)).strftime("%d %b '%y")
 
-def generate_signal(sym: str, prices: list, highs: list, lows: list):
+# ─── SIGNAL ENGINE ────────────────────────────────────────────────────────────
+def generate_signal(sym: str, df: pd.DataFrame) -> dict:
+    prices = df["close"].tolist()
+    highs  = df["high"].tolist()
+    lows   = df["low"].tolist()
+
     if len(prices) < 10:
         return None
+
     s     = pd.Series(prices)
     price = prices[-1]
     rsi   = calc_rsi(s)
@@ -133,18 +212,18 @@ def generate_signal(sym: str, prices: list, highs: list, lows: list):
     if bbpos < 0.2:   sc += 1.5; rs.append("Price near BB lower band")
     elif bbpos > 0.8: sc -= 1.5; rs.append("Price near BB upper band")
 
-    if price > sma20 * 1.02: sc += 0.5
+    if price > sma20 * 1.02:  sc += 0.5
     elif price < sma20 * 0.98: sc -= 0.5
 
     direction  = "LONG" if sc >= 1 else "SHORT" if sc <= -1 else "NEUTRAL"
     confidence = min(99, round(abs(sc) / 6 * 100))
-    k = strike(price)
+    k  = to_strike(price)
     ex = next_expiry()
 
     if direction == "LONG":
         if confidence > 70:
             opt = "Bull Call Spread"
-            det = {"buy": f"{sym} {k} CE", "sell": f"{sym} {strike(price*1.03)} CE",
+            det = {"buy": f"{sym} {k} CE", "sell": f"{sym} {to_strike(price*1.03)} CE",
                    "expiry": ex, "maxProfit": f"₹{round(atr*3)}", "maxLoss": f"₹{round(atr*1.5)}", "premium": f"₹{round(atr*1.2)}"}
         else:
             opt = "ATM Call Buy"
@@ -153,7 +232,7 @@ def generate_signal(sym: str, prices: list, highs: list, lows: list):
     elif direction == "SHORT":
         if confidence > 70:
             opt = "Bear Put Spread"
-            det = {"buy": f"{sym} {k} PE", "sell": f"{sym} {strike(price*0.97)} PE",
+            det = {"buy": f"{sym} {k} PE", "sell": f"{sym} {to_strike(price*0.97)} PE",
                    "expiry": ex, "maxProfit": f"₹{round(atr*3)}", "maxLoss": f"₹{round(atr*1.5)}", "premium": f"₹{round(atr*1.2)}"}
         else:
             opt = "ATM Put Buy"
@@ -161,8 +240,8 @@ def generate_signal(sym: str, prices: list, highs: list, lows: list):
                    "target": f"₹{round(price*0.96,2)}", "stopLoss": f"₹{round(price*1.015,2)}", "premium": f"₹{round(atr*0.8)}"}
     else:
         opt = "Iron Condor"
-        det = {"sellCall": f"{sym} {strike(price*1.025)} CE", "buyCall": f"{sym} {strike(price*1.04)} CE",
-               "sellPut":  f"{sym} {strike(price*0.975)} PE", "buyPut":  f"{sym} {strike(price*0.96)} PE",
+        det = {"sellCall": f"{sym} {to_strike(price*1.025)} CE", "buyCall": f"{sym} {to_strike(price*1.04)} CE",
+               "sellPut":  f"{sym} {to_strike(price*0.975)} PE", "buyPut":  f"{sym} {to_strike(price*0.96)} PE",
                "expiry": ex, "premium": f"₹{round(atr*0.6)}"}
 
     return {
@@ -176,46 +255,23 @@ def generate_signal(sym: str, prices: list, highs: list, lows: list):
         "lastUpdated": datetime.now().isoformat(),
     }
 
-# ─── FETCHER ──────────────────────────────────────────────────────────────────
-def get_nifty() -> dict:
-    try:
-        h = yf.Ticker("^NSEI").history(period="5d", interval="1d")
-        if h.empty:
-            return {"price": 22450.0, "change": 0.0, "changePct": 0.0}
-        price = round(float(h["Close"].iloc[-1]), 2)
-        prev  = round(float(h["Close"].iloc[-2]), 2) if len(h) > 1 else price
-        chg   = round(price - prev, 2)
-        return {"price": price, "change": chg, "changePct": round(chg / prev * 100, 2)}
-    except Exception as e:
-        logger.error(f"Nifty error: {e}")
-        return {"price": 22450.0, "change": 0.0, "changePct": 0.0}
-
+# ─── BATCH FETCHER ────────────────────────────────────────────────────────────
 def do_fetch():
     global _cache, _cache_ts, _fetching
     if _fetching:
-        logger.info("Already fetching, skip")
         return
     _fetching = True
-    logger.info("Fetching Nifty 50 data from Yahoo Finance...")
+    logger.info("Fetching Nifty 50 from Twelve Data...")
     results = []
 
-    # Fetch one by one using Ticker().history() — avoids MultiIndex issues
     for sym in NIFTY50_SYMBOLS:
         try:
-            df = yf.Ticker(f"{sym}.NS").history(period="1mo", interval="1d")
-            df = df.dropna()
-            if len(df) < 10:
-                logger.warning(f"{sym}: only {len(df)} rows, skipping")
-                continue
-            sig = generate_signal(
-                sym,
-                df["Close"].tolist(),
-                df["High"].tolist(),
-                df["Low"].tolist(),
-            )
+            df  = fetch_time_series(sym, outputsize=30)
+            sig = generate_signal(sym, df)
             if sig:
                 results.append(sig)
                 logger.info(f"✓ {sym}: ₹{sig['price']} [{sig['direction']}]")
+            time.sleep(0.25)  # 4 req/sec max on free tier
         except Exception as e:
             logger.error(f"✗ {sym}: {e}")
             continue
@@ -228,29 +284,30 @@ def do_fetch():
         neutrals = sum(1 for s in results if s["direction"] == "NEUTRAL")
         _cache = {
             "stocks": results,
-            "nifty": get_nifty(),
+            "nifty": fetch_nifty_index(),
             "summary": {"longs": longs, "shorts": shorts, "neutrals": neutrals, "total": len(results)},
             "fetchedAt": datetime.now().isoformat(),
             "nextRefresh": CACHE_TTL,
-            "dataSource": "Yahoo Finance (NSE ~15min delayed)",
+            "dataSource": "Twelve Data (NSE real-time)",
         }
         _cache_ts = time.time()
-        logger.info("Cache updated successfully")
+        logger.info("Cache updated ✓")
     else:
-        logger.error("No results — cache NOT updated")
+        logger.error("No results — check TWELVE_API_KEY env var")
 
     _fetching = False
 
 # ─── LIFESPAN ─────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Start background fetch on startup
-    threading.Thread(target=do_fetch, daemon=True).start()
-    logger.info("Startup: background fetch triggered")
+    if not TWELVE_API_KEY:
+        logger.error("TWELVE_API_KEY env var not set!")
+    else:
+        threading.Thread(target=do_fetch, daemon=True).start()
+        logger.info("Startup: background fetch triggered")
     yield
-    logger.info("Shutdown")
 
-app = FastAPI(title="N50 Swing Algo API", version="2.0.0", lifespan=lifespan)
+app = FastAPI(title="N50 Swing Algo API", version="3.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -262,12 +319,13 @@ app.add_middleware(
 # ─── ROUTES ───────────────────────────────────────────────────────────────────
 @app.get("/")
 def root():
-    return {"status": "ok", "message": "N50 Swing Algo API v2"}
+    return {"status": "ok", "message": "N50 Swing Algo API v3 — Twelve Data"}
 
 @app.get("/api/health")
 def health():
     return {
         "status": "healthy",
+        "apiKeySet": bool(TWELVE_API_KEY),
         "cacheAge": round(time.time() - _cache_ts) if _cache_ts else None,
         "stocksCached": len(_cache.get("stocks", [])) if _cache else 0,
         "fetching": _fetching,
@@ -275,16 +333,17 @@ def health():
 
 @app.get("/api/test")
 def test():
-    """Test if Yahoo Finance is reachable."""
+    """Test Twelve Data API connectivity."""
+    if not TWELVE_API_KEY:
+        return {"status": "error", "message": "TWELVE_API_KEY env var not set"}
     try:
-        df = yf.Ticker("RELIANCE.NS").history(period="5d", interval="1d")
-        if df.empty:
-            return {"status": "error", "message": "Empty response from Yahoo Finance"}
+        df = fetch_time_series("RELIANCE", outputsize=5)
         return {
             "status": "ok",
+            "symbol": "RELIANCE:NSE",
             "rows": len(df),
-            "lastClose": round(float(df["Close"].iloc[-1]), 2),
-            "symbol": "RELIANCE.NS",
+            "lastClose": round(float(df["close"].iloc[-1]), 2),
+            "lastDate": str(df["datetime"].iloc[-1].date()),
         }
     except Exception as e:
         return {"status": "error", "message": str(e)}
@@ -293,6 +352,8 @@ def test():
 def refresh():
     """Manually trigger a re-fetch."""
     global _fetching
+    if not TWELVE_API_KEY:
+        return {"status": "error", "message": "TWELVE_API_KEY not set"}
     if _fetching:
         return {"status": "already fetching"}
     threading.Thread(target=do_fetch, daemon=True).start()
@@ -300,28 +361,30 @@ def refresh():
 
 @app.get("/api/stocks")
 def get_stocks():
-    global _cache, _cache_ts
-
-    # Fresh cache — return immediately
+    # Fresh cache
     if _cache and (time.time() - _cache_ts) < CACHE_TTL:
         return JSONResponse(content=_cache)
 
-    # Stale but available — trigger background refresh, return stale
+    # Stale cache — return it and refresh in background
     if _cache:
         if not _fetching:
             threading.Thread(target=do_fetch, daemon=True).start()
         return JSONResponse(content=_cache)
 
-    # No cache yet — still loading
+    # No cache yet
+    if not TWELVE_API_KEY:
+        return JSONResponse(status_code=503, content={
+            "error": "TWELVE_API_KEY environment variable not set on server"
+        })
+
     if _fetching:
         return JSONResponse(status_code=503, content={
-            "error": "Data is loading for the first time, please retry in 30 seconds",
+            "error": "Data is loading for the first time, please retry in 60 seconds",
             "fetching": True,
         })
 
-    # Nothing — trigger fetch
     threading.Thread(target=do_fetch, daemon=True).start()
     return JSONResponse(status_code=503, content={
-        "error": "Fetching data now, please retry in 30 seconds",
+        "error": "Fetching data now, please retry in 60 seconds",
         "fetching": True,
     })
