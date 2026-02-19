@@ -199,21 +199,19 @@ def do_fetch():
     logger.info("Fetching Nifty 50 data from Yahoo Finance...")
     results = []
 
-    # Fetch one by one — most reliable, avoids multi-ticker column issues
+    # Fetch one by one using Ticker().history() — avoids MultiIndex issues
     for sym in NIFTY50_SYMBOLS:
         try:
-            ticker = f"{sym}.NS"
-            df = yf.download(ticker, period="1mo", interval="1d",
-                             auto_adjust=True, progress=False)
+            df = yf.Ticker(f"{sym}.NS").history(period="1mo", interval="1d")
             df = df.dropna()
             if len(df) < 10:
                 logger.warning(f"{sym}: only {len(df)} rows, skipping")
                 continue
             sig = generate_signal(
                 sym,
-                df["Close"].squeeze().tolist(),
-                df["High"].squeeze().tolist(),
-                df["Low"].squeeze().tolist(),
+                df["Close"].tolist(),
+                df["High"].tolist(),
+                df["Low"].tolist(),
             )
             if sig:
                 results.append(sig)
@@ -279,14 +277,13 @@ def health():
 def test():
     """Test if Yahoo Finance is reachable."""
     try:
-        df = yf.download("RELIANCE.NS", period="5d", interval="1d",
-                         auto_adjust=True, progress=False)
+        df = yf.Ticker("RELIANCE.NS").history(period="5d", interval="1d")
         if df.empty:
             return {"status": "error", "message": "Empty response from Yahoo Finance"}
         return {
             "status": "ok",
             "rows": len(df),
-            "lastClose": round(float(df["Close"].squeeze().iloc[-1]), 2),
+            "lastClose": round(float(df["Close"].iloc[-1]), 2),
             "symbol": "RELIANCE.NS",
         }
     except Exception as e:
