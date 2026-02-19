@@ -91,8 +91,8 @@ export default function App() {
     } catch (e) {
       setError(e.message);
       setLoading(false);
-      // Auto-retry after 8s (handles Render cold start)
-      setTimeout(fetchData, 8000);
+      // Auto-retry after 15s (handles Render cold start + first fetch)
+      setTimeout(fetchData, 15000);
     }
   }, []);
 
@@ -301,7 +301,7 @@ export default function App() {
 
         {/* CONTROLS */}
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
-          <input value={search} onChange={e => setSearch(e.target.value)}
+          <input id="symbol-search" name="symbol-search" value={search} onChange={e => setSearch(e.target.value)}
             placeholder="🔍 Search symbol..." style={{
               background: "rgba(15,23,42,0.7)", border: "1px solid rgba(255,255,255,0.07)",
               borderRadius: 6, padding: "6px 12px", color: "#e2e8f0",
