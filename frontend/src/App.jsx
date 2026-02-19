@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from "react";
 
-const API_BASE = import.meta.env.VITE_API_URL || "http://localhost:8000";
+const _apiUrl = import.meta.env.VITE_API_URL || "http://localhost:8000";
+const API_BASE = _apiUrl.startsWith("http") ? _apiUrl : `https://${_apiUrl}`;
 
 // ─── SPARKLINE ────────────────────────────────────────────────────────────────
 function Sparkline({ prices, color, width = 88, height = 20 }) {

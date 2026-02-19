@@ -25,7 +25,7 @@ services:
         fromService:
           name: n50-backend
           type: web
-          property: hostWithScheme
+          property: host
       - key: NODE_VERSION
         value: "20"
     routes:
