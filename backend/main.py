@@ -1,19 +1,16 @@
 """
-N50 Swing Algo — Backend API
-Data: Stooq.com (free, no API key, no account, NSE daily data)
-URL format: https://stooq.com/q/d/l/?s=reliance.ns&i=d
+N50 Swing Algo — Backend API v5
+Data: nsepython library (official NSE data, works from cloud servers)
 """
 
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-import httpx
 import pandas as pd
 import threading
 import logging
 import time
-import io
 from datetime import datetime, timedelta
 
 logging.basicConfig(level=logging.INFO)
@@ -59,56 +56,52 @@ _cache_ts: float = 0
 _fetching: bool = False
 CACHE_TTL = 3600  # 1 hour
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-}
-
-# ─── STOOQ FETCHER ────────────────────────────────────────────────────────────
-def fetch_stooq(symbol: str) -> pd.DataFrame:
-    """
-    Fetch daily OHLCV from Stooq for NSE symbol.
-    Stooq uses lowercase .ns suffix: reliance.ns
-    Returns CSV with columns: Date, Open, High, Low, Close, Volume
-    """
-    ticker = symbol.lower().replace("&", "") + ".ns"
-    url = f"https://stooq.com/q/d/l/?s={ticker}&i=d"
-
-    with httpx.Client(timeout=20, headers=HEADERS, follow_redirects=True) as client:
-        r = client.get(url)
-        r.raise_for_status()
-
-    # Stooq returns "No data" for invalid symbols
-    if "No data" in r.text or len(r.text.strip()) < 50:
-        raise ValueError(f"No data returned for {symbol}")
-
-    df = pd.read_csv(io.StringIO(r.text))
-    df.columns = [c.strip().lower() for c in df.columns]
-    df["date"] = pd.to_datetime(df["date"])
-    df = df.sort_values("date").tail(60).reset_index(drop=True)
-
-    for col in ["open", "high", "low", "close"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    df = df.dropna(subset=["close"])
+# ─── DATA FETCHER (nsepython) ─────────────────────────────────────────────────
+def fetch_stock(symbol: str) -> pd.DataFrame:
+    from nsepython import equity_history
+    end   = datetime.now().strftime("%d-%m-%Y")
+    start = (datetime.now() - timedelta(days=90)).strftime("%d-%m-%Y")
+    df = equity_history(symbol, "EQ", start, end)
+    df = df.rename(columns={
+        "CH_TIMESTAMP":        "date",
+        "CH_OPENING_PRICE":    "open",
+        "CH_TRADE_HIGH_PRICE": "high",
+        "CH_TRADE_LOW_PRICE":  "low",
+        "CH_CLOSING_PRICE":    "close",
+    })
+    df["date"]  = pd.to_datetime(df["date"])
+    df["open"]  = pd.to_numeric(df["open"],  errors="coerce")
+    df["high"]  = pd.to_numeric(df["high"],  errors="coerce")
+    df["low"]   = pd.to_numeric(df["low"],   errors="coerce")
+    df["close"] = pd.to_numeric(df["close"], errors="coerce")
+    df = df.dropna(subset=["close"]).sort_values("date").tail(60).reset_index(drop=True)
     return df
 
 
 def fetch_nifty() -> dict:
     try:
-        # Nifty 50 index on Stooq
-        url = "https://stooq.com/q/d/l/?s=^nsei&i=d"
-        with httpx.Client(timeout=20, headers=HEADERS, follow_redirects=True) as client:
-            r = client.get(url)
-        df = pd.read_csv(io.StringIO(r.text))
-        df.columns = [c.strip().lower() for c in df.columns]
-        df = df.sort_values("date").tail(2)
-        price = round(float(df["close"].iloc[-1]), 2)
-        prev  = round(float(df["close"].iloc[-2]), 2) if len(df) > 1 else price
-        chg   = round(price - prev, 2)
-        return {"price": price, "change": chg, "changePct": round(chg / prev * 100, 2)}
+        from nsepython import nse_eq_symbols, nifty50_gainers
+        import httpx, json
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://www.nseindia.com",
+            "Accept": "*/*",
+        }
+        with httpx.Client(headers=headers, follow_redirects=True, timeout=15) as c:
+            c.get("https://www.nseindia.com")
+            time.sleep(0.5)
+            r = c.get("https://www.nseindia.com/api/allIndices")
+            data = r.json()
+        for idx in data.get("data", []):
+            if idx.get("index") == "NIFTY 50":
+                return {
+                    "price":     round(float(idx["last"]), 2),
+                    "change":    round(float(idx["change"]), 2),
+                    "changePct": round(float(idx["percentChange"]), 2),
+                }
     except Exception as e:
         logger.error(f"Nifty index error: {e}")
-        return {"price": 22450.0, "change": 0.0, "changePct": 0.0}
+    return {"price": 22450.0, "change": 0.0, "changePct": 0.0}
 
 # ─── INDICATORS ───────────────────────────────────────────────────────────────
 def calc_rsi(s: pd.Series, p: int = 14) -> float:
@@ -171,7 +164,6 @@ def generate_signal(sym: str, df: pd.DataFrame) -> dict:
     prices = df["close"].tolist()
     highs  = df["high"].tolist()
     lows   = df["low"].tolist()
-
     if len(prices) < 10:
         return None
 
@@ -253,17 +245,20 @@ def do_fetch():
     if _fetching:
         return
     _fetching = True
-    logger.info("Fetching Nifty 50 from Stooq...")
+    logger.info("Fetching all Nifty 50 via nsepython...")
     results = []
 
     for sym in NIFTY50_SYMBOLS:
         try:
-            df  = fetch_stooq(sym)
+            df  = fetch_stock(sym)
+            if df.empty or len(df) < 10:
+                logger.warning(f"✗ {sym}: insufficient data ({len(df)} rows)")
+                continue
             sig = generate_signal(sym, df)
             if sig:
                 results.append(sig)
                 logger.info(f"✓ {sym}: ₹{sig['price']} [{sig['direction']}]")
-            time.sleep(0.3)  # be polite to Stooq
+            time.sleep(0.5)  # polite delay
         except Exception as e:
             logger.error(f"✗ {sym}: {e}")
             continue
@@ -280,12 +275,12 @@ def do_fetch():
             "summary": {"longs": longs, "shorts": shorts, "neutrals": neutrals, "total": len(results)},
             "fetchedAt": datetime.now().isoformat(),
             "nextRefresh": CACHE_TTL,
-            "dataSource": "Stooq (NSE daily data, free)",
+            "dataSource": "NSE India (via nsepython)",
         }
         _cache_ts = time.time()
-        logger.info("Cache updated ✓")
+        logger.info("✓ Cache updated")
     else:
-        logger.error("No results fetched!")
+        logger.error("No results — all fetches failed")
 
     _fetching = False
 
@@ -296,7 +291,7 @@ async def lifespan(app: FastAPI):
     logger.info("Startup: background fetch triggered")
     yield
 
-app = FastAPI(title="N50 Swing Algo API", version="4.0.0", lifespan=lifespan)
+app = FastAPI(title="N50 Swing Algo API", version="5.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -308,7 +303,7 @@ app.add_middleware(
 # ─── ROUTES ───────────────────────────────────────────────────────────────────
 @app.get("/")
 def root():
-    return {"status": "ok", "message": "N50 Swing Algo API v4 — Stooq"}
+    return {"status": "ok", "message": "N50 Swing Algo API v5 — nsepython"}
 
 @app.get("/api/health")
 def health():
@@ -321,12 +316,12 @@ def health():
 
 @app.get("/api/test")
 def test():
-    """Test Stooq connectivity with RELIANCE."""
+    """Test NSE connectivity with INFY."""
     try:
-        df = fetch_stooq("RELIANCE")
+        df = fetch_stock("INFY")
         return {
             "status": "ok",
-            "symbol": "RELIANCE.ns (Stooq)",
+            "symbol": "INFY",
             "rows": len(df),
             "lastClose": round(float(df["close"].iloc[-1]), 2),
             "lastDate": str(df["date"].iloc[-1].date()),
@@ -345,24 +340,24 @@ def refresh():
 
 @app.get("/api/stocks")
 def get_stocks():
-    # Fresh cache
+    # Fresh cache — return immediately
     if _cache and (time.time() - _cache_ts) < CACHE_TTL:
         return JSONResponse(content=_cache)
 
-    # Stale — return and refresh in background
+    # Stale cache — return it and refresh in background
     if _cache:
         if not _fetching:
             threading.Thread(target=do_fetch, daemon=True).start()
         return JSONResponse(content=_cache)
 
-    # Still loading
+    # Still loading first time
     if _fetching:
         return JSONResponse(status_code=503, content={
             "error": "Data is loading for the first time, please retry in 60 seconds",
             "fetching": True,
         })
 
-    # Trigger and return
+    # Nothing yet — trigger and return 503
     threading.Thread(target=do_fetch, daemon=True).start()
     return JSONResponse(status_code=503, content={
         "error": "Fetching data now, please retry in 60 seconds",
