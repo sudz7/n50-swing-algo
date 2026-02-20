@@ -61,37 +61,43 @@ def fetch_stock(symbol: str) -> pd.DataFrame:
     from nsepython import equity_history
     end   = datetime.now().strftime("%d-%m-%Y")
     start = (datetime.now() - timedelta(days=90)).strftime("%d-%m-%Y")
+
+    # equity_history returns a DataFrame directly
     df = equity_history(symbol, "EQ", start, end)
-    df = df.rename(columns={
-        "CH_TIMESTAMP":        "date",
-        "CH_OPENING_PRICE":    "open",
-        "CH_TRADE_HIGH_PRICE": "high",
-        "CH_TRADE_LOW_PRICE":  "low",
-        "CH_CLOSING_PRICE":    "close",
-    })
-    df["date"]  = pd.to_datetime(df["date"])
-    df["open"]  = pd.to_numeric(df["open"],  errors="coerce")
-    df["high"]  = pd.to_numeric(df["high"],  errors="coerce")
-    df["low"]   = pd.to_numeric(df["low"],   errors="coerce")
-    df["close"] = pd.to_numeric(df["close"], errors="coerce")
+
+    if df is None or df.empty:
+        raise ValueError(f"Empty data for {symbol}")
+
+    # Normalise column names to lowercase
+    df.columns = [c.strip().lower() for c in df.columns]
+
+    # Map NSE column names → standard names
+    col_map = {
+        "ch_timestamp":        "date",
+        "ch_opening_price":    "open",
+        "ch_trade_high_price": "high",
+        "ch_trade_low_price":  "low",
+        "ch_closing_price":    "close",
+    }
+    df = df.rename(columns=col_map)
+
+    # Keep only what we need
+    needed = [c for c in ["date", "open", "high", "low", "close"] if c in df.columns]
+    df = df[needed]
+
+    df["date"]  = pd.to_datetime(df["date"], errors="coerce")
+    for col in ["open", "high", "low", "close"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
     df = df.dropna(subset=["close"]).sort_values("date").tail(60).reset_index(drop=True)
     return df
 
 
 def fetch_nifty() -> dict:
     try:
-        from nsepython import nse_eq_symbols, nifty50_gainers
-        import httpx, json
-        headers = {
-            "User-Agent": "Mozilla/5.0",
-            "Referer": "https://www.nseindia.com",
-            "Accept": "*/*",
-        }
-        with httpx.Client(headers=headers, follow_redirects=True, timeout=15) as c:
-            c.get("https://www.nseindia.com")
-            time.sleep(0.5)
-            r = c.get("https://www.nseindia.com/api/allIndices")
-            data = r.json()
+        from nsepython import nsefetch
+        data = nsefetch("https://www.nseindia.com/api/allIndices")
         for idx in data.get("data", []):
             if idx.get("index") == "NIFTY 50":
                 return {
@@ -99,6 +105,7 @@ def fetch_nifty() -> dict:
                     "change":    round(float(idx["change"]), 2),
                     "changePct": round(float(idx["percentChange"]), 2),
                 }
+        logger.warning("NIFTY 50 not found in allIndices response")
     except Exception as e:
         logger.error(f"Nifty index error: {e}")
     return {"price": 22450.0, "change": 0.0, "changePct": 0.0}
@@ -141,6 +148,10 @@ def calc_bb(s: pd.Series, p: int = 20) -> dict:
 def calc_atr(hi: pd.Series, lo: pd.Series, cl: pd.Series, p: int = 14) -> float:
     if len(cl) < p + 1:
         return 0
+    # Reset indices to avoid alignment issues on concat
+    hi = hi.reset_index(drop=True)
+    lo = lo.reset_index(drop=True)
+    cl = cl.reset_index(drop=True)
     tr = pd.concat([
         hi - lo,
         (hi - cl.shift()).abs(),
@@ -323,11 +334,20 @@ def test():
             "status": "ok",
             "symbol": "INFY",
             "rows": len(df),
+            "columns": list(df.columns),
             "lastClose": round(float(df["close"].iloc[-1]), 2),
             "lastDate": str(df["date"].iloc[-1].date()),
         }
     except Exception as e:
-        return {"status": "error", "message": str(e)}
+        # Also return raw columns if possible for debugging
+        try:
+            from nsepython import equity_history
+            end   = datetime.now().strftime("%d-%m-%Y")
+            start = (datetime.now() - timedelta(days=10)).strftime("%d-%m-%Y")
+            raw = equity_history("INFY", "EQ", start, end)
+            return {"status": "error", "message": str(e), "rawColumns": list(raw.columns) if hasattr(raw, 'columns') else str(type(raw))}
+        except Exception as e2:
+            return {"status": "error", "message": str(e), "rawError": str(e2)}
 
 @app.get("/api/refresh")
 def refresh():
